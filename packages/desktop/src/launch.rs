@@ -87,6 +87,12 @@ pub fn launch_virtual_dom_blocking(virtual_dom: VirtualDom, mut desktop_config: 
                 UserWindowEvent::RequestWindowClose(id) => app.handle_close_requested(id),
                 UserWindowEvent::DestroyWindow(id) => app.destroy_window(id),
                 UserWindowEvent::Shutdown => app.control_flow = tao::event_loop::ControlFlow::Exit,
+                UserWindowEvent::ProtocolRequest {
+                    id,
+                    webview_id,
+                    protocol,
+                    request,
+                } => app.handle_protocol_request(id, &webview_id, &protocol, request),
 
                 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                 UserWindowEvent::GlobalHotKeyEvent(evnt) => app.handle_global_hotkey(evnt),

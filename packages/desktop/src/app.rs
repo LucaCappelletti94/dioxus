@@ -1,7 +1,7 @@
 use crate::{
     config::{Config, WindowCloseBehaviour},
     desktop_state::{DesktopAppContext, WindowCloseRequestResult},
-    ipc::{IpcMessage, UserWindowEvent},
+    ipc::{IpcMessage, PendingProtocolRequest, UserWindowEvent},
     query::QueryResult,
     waker::create_dom_waker,
     webview::WebviewInstance,
@@ -301,6 +301,30 @@ impl App {
         self.schedule_poll();
     }
 
+    /// Answer a forwarded protocol request, also when its window is gone, so the page never waits.
+    pub fn handle_protocol_request(
+        &self,
+        id: WindowId,
+        webview_id: &str,
+        protocol: &str,
+        request: PendingProtocolRequest,
+    ) {
+        let Some((request, responder)) = request.take() else {
+            return;
+        };
+        match self.webviews.get(&id) {
+            Some(webview) => {
+                webview.handle_protocol_request(webview_id, protocol, request, responder)
+            }
+            None => responder.respond(
+                wry::http::Response::builder()
+                    .status(wry::http::StatusCode::GONE)
+                    .body(Vec::new())
+                    .expect("a status and an empty body form a valid response"),
+            ),
+        }
+    }
+
     pub fn handle_query_msg(&mut self, msg: IpcMessage, id: WindowId) {
         let Ok(result) = serde_json::from_value::<QueryResult>(msg.params()) else {
             return;
@@ -334,11 +358,6 @@ impl App {
 
                 if !self.webviews.is_empty() {
                     {
-                        // This is a place where wry says it's threadsafe but it's actually not.
-                        // If we're patching the app, we want to make sure it's not going to progress in the interim.
-                        #[cfg(target_os = "android")]
-                        let _lock = crate::android_sync_lock::android_runtime_lock();
-
                         if let Err(err) = dioxus_devtools::try_apply_changes(&self.dom, &hr_msg) {
                             tracing::error!("Failed to apply hot-patch: {err}");
                             patch_error = Some(err);
@@ -444,9 +463,6 @@ impl App {
             }
 
             {
-                // lock the hack-ed in lock sync wry has some thread-safety issues with event handlers and async tasks
-                #[cfg(target_os = "android")]
-                let _lock = crate::android_sync_lock::android_runtime_lock();
                 let fut = self.dom.wait_for_work();
                 pin_mut!(fut);
 
@@ -455,10 +471,6 @@ impl App {
                     std::task::Poll::Pending => return,
                 }
             }
-
-            // lock the hack-ed in lock sync wry has some thread-safety issues with event handlers
-            #[cfg(target_os = "android")]
-            let _lock = crate::android_sync_lock::android_runtime_lock();
 
             self.render_dom_immediate();
             self.send_touched_edits();

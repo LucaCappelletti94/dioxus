@@ -113,6 +113,7 @@ Browser event → JavaScript → window.postMessage()
 - `__file_dialog` for file selection
 - Custom handler namespaces for user-provided handlers
 - Checks `dioxus_asset_resolver` for bundled assets
+- Each registered handler posts a `UserWindowEvent::ProtocolRequest`, answered on the event loop where the window's handlers live
 
 ### Native Features
 - Menu integration via muda crate

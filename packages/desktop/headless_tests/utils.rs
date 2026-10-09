@@ -25,6 +25,25 @@ pub fn check_app_exits(app: fn() -> Element) {
     should_panic.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
+pub fn check_app_exits_with_cfg(app: fn() -> Element, mut cfg: dioxus_desktop::Config) {
+    use dioxus_desktop::tao::window::WindowBuilder;
+    let should_panic = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let should_panic_clone = should_panic.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        if should_panic_clone.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!("App did not exit in time");
+            std::process::exit(exitcode::SOFTWARE);
+        }
+    });
+
+    cfg = cfg.with_window(WindowBuilder::new().with_visible(false));
+
+    dioxus::LaunchBuilder::desktop().with_cfg(cfg).launch(app);
+
+    should_panic.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub static EXPECTED_EVENTS: GlobalSignal<usize> = Signal::global(|| 0);
 
 pub fn mock_event(id: &'static str, value: &'static str) {

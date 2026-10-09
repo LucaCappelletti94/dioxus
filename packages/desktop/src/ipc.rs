@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 use tao::window::WindowId;
+use wry::{RequestAsyncResponder, http::Request};
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -41,11 +43,46 @@ pub enum UserWindowEvent {
     /// Request that a given window close, honoring its close behavior and component lifecycle.
     RequestWindowClose(WindowId),
 
+    /// Serve a custom protocol request on the event loop thread, where the window's handlers live.
+    ProtocolRequest {
+        id: WindowId,
+        webview_id: String,
+        protocol: String,
+        request: PendingProtocolRequest,
+    },
+
     /// Destroy a native window after its Dioxus owner has released the portal.
     DestroyWindow(WindowId),
 
     /// Gracefully shutdown the entire app
     Shutdown,
+}
+
+type ProtocolExchange = (Request<Vec<u8>>, RequestAsyncResponder);
+
+/// A protocol request and the responder that answers it, taken exactly once on the event loop.
+#[derive(Clone)]
+pub struct PendingProtocolRequest(Arc<Mutex<Option<ProtocolExchange>>>);
+
+impl PendingProtocolRequest {
+    pub(crate) fn new(request: Request<Vec<u8>>, responder: RequestAsyncResponder) -> Self {
+        Self(Arc::new(Mutex::new(Some((request, responder)))))
+    }
+
+    /// The request and its responder, or `None` if another copy of this event took them.
+    pub(crate) fn take(&self) -> Option<ProtocolExchange> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+impl std::fmt::Debug for PendingProtocolRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingProtocolRequest")
+            .finish_non_exhaustive()
+    }
 }
 
 /// A message struct that manages the communication between the webview and the eventloop code

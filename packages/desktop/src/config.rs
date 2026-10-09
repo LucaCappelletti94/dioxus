@@ -51,15 +51,15 @@ impl From<MenuBuilderState> for Option<DioxusMenu> {
     }
 }
 
-pub(crate) type WryProtocol = (
-    String,
-    Box<dyn Fn(WebViewId, HttpRequest<Vec<u8>>) -> HttpResponse<Cow<'static, [u8]>> + 'static>,
-);
+pub(crate) type ProtocolHandler =
+    Box<dyn Fn(WebViewId, HttpRequest<Vec<u8>>) -> HttpResponse<Cow<'static, [u8]>> + 'static>;
 
-pub(crate) type AsyncWryProtocol = (
-    String,
-    Box<dyn Fn(WebViewId, HttpRequest<Vec<u8>>, RequestAsyncResponder) + 'static>,
-);
+pub(crate) type AsyncProtocolHandler =
+    Box<dyn Fn(WebViewId, HttpRequest<Vec<u8>>, RequestAsyncResponder) + 'static>;
+
+pub(crate) type WryProtocol = (String, ProtocolHandler);
+
+pub(crate) type AsyncWryProtocol = (String, AsyncProtocolHandler);
 
 /// The configuration for a single desktop window.
 ///

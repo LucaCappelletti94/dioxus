@@ -4,18 +4,28 @@ use crate::desktop_state::DesktopAppContext;
 use crate::file_upload::{DesktopFileData, DesktopFileDragEvent};
 use crate::menubar::DioxusMenu;
 use crate::{
-    DesktopContext, DesktopService, WindowConfig, assets::AssetHandlerRegistry, edits::WryQueue,
-    file_upload::NativeFileHover, ipc::UserWindowEvent, protocol,
+    DesktopContext, DesktopService, WindowConfig,
+    assets::AssetHandlerRegistry,
+    config::{AsyncProtocolHandler, ProtocolHandler},
+    edits::WryQueue,
+    file_upload::NativeFileHover,
+    ipc::{PendingProtocolRequest, UserWindowEvent},
+    protocol,
 };
 use crate::{element::DesktopElement, file_upload::DesktopFormData};
 use base64::prelude::BASE64_STANDARD;
 use dioxus_core::{RenderTargetId, Runtime, VirtualDom};
 use dioxus_hooks::to_owned;
 use dioxus_html::{FileData, FormValue, HtmlEvent, PlatformEventData, SerializedFileData};
+use rustc_hash::FxHashMap;
 use std::rc::Rc;
 use std::sync::{Arc, atomic::AtomicBool};
 use std::{cell::OnceCell, time::Duration};
-use wry::{DragDropEvent, RequestAsyncResponder, WebContext, WebViewBuilder, WebViewId};
+use tao::{event_loop::EventLoopProxy, window::WindowId};
+use wry::{
+    DragDropEvent, RequestAsyncResponder, WebContext, WebViewBuilder, WebViewId,
+    http::{Request, Response, status::StatusCode},
+};
 
 fn restore_window_state(
     window: &tao::window::Window,
@@ -107,12 +117,7 @@ impl WebviewEdits {
             .map_err(|_| Error::custom("dioxus-data header is not a base64 string"))?;
 
         let response = match serde_json::from_slice(&data_from_header) {
-            Ok(event) => {
-                // we need to wait for the mutex lock to let us munge the main thread..
-                #[cfg(target_os = "android")]
-                let _lock = crate::android_sync_lock::android_runtime_lock();
-                self.handle_html_event(event)
-            }
+            Ok(event) => self.handle_html_event(event),
             Err(err) => {
                 tracing::error!(
                     "Error parsing user_event: {:?}. \n Contents: {:?}, \nraw: {:#?}",
@@ -227,8 +232,31 @@ impl WebviewEdits {
     }
 }
 
+/// A `Send + Sync` wry handler that posts each `protocol` request to the event loop.
+fn forward_protocol(
+    proxy: EventLoopProxy<UserWindowEvent>,
+    window: WindowId,
+    protocol: String,
+) -> impl Fn(WebViewId, Request<Vec<u8>>, RequestAsyncResponder) + Send + Sync + 'static {
+    move |webview_id, request, responder| {
+        _ = proxy.send_event(UserWindowEvent::ProtocolRequest {
+            id: window,
+            webview_id: webview_id.to_string(),
+            protocol: protocol.clone(),
+            request: PendingProtocolRequest::new(request, responder),
+        });
+    }
+}
+
 pub(crate) struct WebviewInstance {
     pub edits: WebviewEdits,
+    protocols: FxHashMap<String, ProtocolHandler>,
+    async_protocols: FxHashMap<String, AsyncProtocolHandler>,
+    custom_head: Option<String>,
+    custom_index: Option<String>,
+    root_name: String,
+    headless: bool,
+
     pub desktop_context: DesktopContext,
 
     // Wry assumes the webcontext is alive for the lifetime of the webview.
@@ -312,34 +340,11 @@ impl WebviewInstance {
         let file_hover = NativeFileHover::default();
         let headless = !cfg.window.window.visible;
 
-        let request_handler = {
-            to_owned![
-                cfg.custom_head,
-                cfg.custom_index,
-                cfg.root_name,
-                asset_handlers,
-                edits
-            ];
-
-            #[cfg(feature = "tokio_runtime")]
-            let tokio_rt = tokio::runtime::Handle::current();
-
-            move |_id: WebViewId, request, responder: RequestAsyncResponder| {
-                #[cfg(feature = "tokio_runtime")]
-                let _guard = tokio_rt.enter();
-
-                protocol::desktop_handler(
-                    request,
-                    asset_handlers.clone(),
-                    responder,
-                    &edits,
-                    custom_head.clone(),
-                    custom_index.clone(),
-                    &root_name,
-                    headless,
-                )
-            }
-        };
+        let request_handler = forward_protocol(
+            app_context.proxy.clone(),
+            window.id(),
+            String::from("dioxus"),
+        );
 
         let ipc_handler = {
             let window_id = window.id();
@@ -452,26 +457,19 @@ impl WebviewInstance {
             webview = webview.with_background_color(color);
         }
 
-        for (name, handler) in cfg.protocols.drain(..) {
-            #[cfg(feature = "tokio_runtime")]
-            let tokio_rt = tokio::runtime::Handle::current();
+        let mut protocols: FxHashMap<String, ProtocolHandler> = FxHashMap::default();
+        let mut async_protocols: FxHashMap<String, AsyncProtocolHandler> = FxHashMap::default();
 
-            webview = webview.with_custom_protocol(name, move |a, b| {
-                #[cfg(feature = "tokio_runtime")]
-                let _guard = tokio_rt.enter();
-                handler(a, b)
-            });
+        for (name, handler) in cfg.protocols.drain(..) {
+            let forward = forward_protocol(app_context.proxy.clone(), window.id(), name.clone());
+            webview = webview.with_asynchronous_custom_protocol(name.clone(), forward);
+            protocols.insert(name, handler);
         }
 
         for (name, handler) in cfg.asynchronous_protocols.drain(..) {
-            #[cfg(feature = "tokio_runtime")]
-            let tokio_rt = tokio::runtime::Handle::current();
-
-            webview = webview.with_asynchronous_custom_protocol(name, move |a, b, c| {
-                #[cfg(feature = "tokio_runtime")]
-                let _guard = tokio_rt.enter();
-                handler(a, b, c)
-            });
+            let forward = forward_protocol(app_context.proxy.clone(), window.id(), name.clone());
+            webview = webview.with_asynchronous_custom_protocol(name.clone(), forward);
+            async_protocols.insert(name, handler);
         }
 
         const INITIALIZATION_SCRIPT: &str = r#"
@@ -557,9 +555,58 @@ impl WebviewInstance {
         WebviewInstance {
             edits,
             desktop_context,
+            protocols,
+            async_protocols,
+            custom_head: cfg.custom_head,
+            custom_index: cfg.custom_index,
+            root_name: cfg.root_name,
+            headless,
             _menu: menu,
             _web_context: web_context,
         }
+    }
+
+    /// Answer a protocol request on the event loop thread, where the window's `Rc` handlers live.
+    pub(crate) fn handle_protocol_request(
+        &self,
+        webview_id: &str,
+        protocol: &str,
+        request: Request<Vec<u8>>,
+        responder: RequestAsyncResponder,
+    ) {
+        #[cfg(feature = "tokio_runtime")]
+        let _guard = tokio::runtime::Handle::current().enter();
+
+        if let Some(handler) = self.protocols.get(protocol) {
+            responder.respond(handler(webview_id, request));
+            return;
+        }
+
+        if let Some(handler) = self.async_protocols.get(protocol) {
+            handler(webview_id, request, responder);
+            return;
+        }
+
+        if protocol == "dioxus" {
+            protocol::desktop_handler(
+                request,
+                self.desktop_context.asset_handlers.clone(),
+                responder,
+                &self.edits,
+                self.custom_head.clone(),
+                self.custom_index.clone(),
+                &self.root_name,
+                self.headless,
+            );
+            return;
+        }
+
+        responder.respond(
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(String::from("Unknown protocol").into_bytes())
+                .unwrap(),
+        );
     }
 
     #[cfg(all(feature = "devtools", debug_assertions))]

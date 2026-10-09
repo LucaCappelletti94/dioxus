@@ -5,7 +5,6 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(unexpected_cfgs)]
 
-mod android_sync_lock;
 mod app;
 mod assets;
 mod config;
