@@ -1,7 +1,9 @@
 use crate::{
+    DesktopContext,
     config::{Config, WindowCloseBehaviour},
     desktop_state::{DesktopAppContext, WindowCloseRequestResult},
     ipc::{IpcMessage, PendingProtocolRequest, UserWindowEvent},
+    native_hosts::{NativeHosts, OnDestroyed, OnStarted},
     query::QueryResult,
     waker::create_dom_waker,
     webview::WebviewInstance,
@@ -36,7 +38,13 @@ pub(crate) struct App {
     pub(crate) control_flow: ControlFlow,
     pub(crate) exit_on_last_window_close: bool,
     pub(crate) disable_dma_buf_on_wayland: bool,
+    /// Hosts that render a logical window, keyed by native window.
     pub(crate) webviews: HashMap<WindowId, WebviewInstance>,
+    /// Live hosts that render nothing, such as an Android `Activity` being replaced.
+    detached: HashMap<WindowId, WebviewInstance>,
+    /// Every open logical window, hosted or waiting for a host.
+    windows: HashMap<RenderTargetId, DesktopContext>,
+    hosts: NativeHosts<WindowId, RenderTargetId>,
     pub(crate) float_all: bool,
     pub(crate) show_devtools: bool,
     pub(crate) tray_icon_show_window_on_click: bool,
@@ -61,6 +69,9 @@ impl App {
             exit_on_last_window_close: cfg.exit_on_last_window_close,
             disable_dma_buf_on_wayland: cfg.disable_dma_buf_on_wayland,
             webviews: HashMap::new(),
+            detached: HashMap::new(),
+            windows: HashMap::new(),
+            hosts: NativeHosts::default(),
             control_flow: ControlFlow::Wait,
             dom: virtual_dom,
             initial_dom_rebuild_done: false,
@@ -106,7 +117,9 @@ impl App {
         self.control_flow = ControlFlow::Wait;
         self.app_context
             .event_handlers
-            .apply_event(window_event, &self.app_context.target);
+            .apply_event(window_event, &self.app_context.target, |id| {
+                self.hosts.target_of(id)
+            });
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
@@ -119,17 +132,14 @@ impl App {
         match event.id().0.as_str() {
             "dioxus-float-top" => {
                 for app_webview in self.webviews.values() {
-                    app_webview
-                        .desktop_context
-                        .window
-                        .set_always_on_top(self.float_all);
+                    app_webview.native.window.set_always_on_top(self.float_all);
                 }
                 self.float_all = !self.float_all;
             }
             "dioxus-toggle-dev-tools" => {
                 self.show_devtools = !self.show_devtools;
                 for app_webview in self.webviews.values() {
-                    let wv = &app_webview.desktop_context.webview;
+                    let wv = &app_webview.native.webview;
                     if self.show_devtools {
                         wv.open_devtools();
                     } else {
@@ -157,8 +167,8 @@ impl App {
         {
             if button == tray_icon::MouseButton::Left && self.tray_icon_show_window_on_click {
                 for app_webview in self.webviews.values() {
-                    app_webview.desktop_context.window.set_visible(true);
-                    app_webview.desktop_context.window.set_focus();
+                    app_webview.native.window.set_visible(true);
+                    app_webview.native.window.set_focus();
                 }
             }
         }
@@ -174,22 +184,97 @@ impl App {
 
     pub fn handle_new_window(&mut self) {
         for pending_webview in self.app_context.drain_pending_webviews() {
-            let app_webview = pending_webview.create_window(&mut self.dom, &self.app_context);
-            let id = app_webview.desktop_context.window.id();
-            self.webviews.insert(id, app_webview);
+            let (pending_webview, error) =
+                match pending_webview.create_window(&mut self.dom, &self.app_context) {
+                    Ok(app_webview) => {
+                        self.bind_host(app_webview);
+                        continue;
+                    }
+                    Err(deferred) => *deferred,
+                };
+            // Android builds a window only on an `Activity` without one, so wait for one to start.
+            if !cfg!(target_os = "android") {
+                panic!("Failed to create a window: {error}");
+            }
+            tracing::debug!("Deferring a window until an Activity starts: {error}");
+            self.app_context.queue_pending_webview(pending_webview);
         }
     }
 
+    /// Make `app_webview` the host of its logical window, detaching the window's previous host.
+    fn bind_host(&mut self, app_webview: WebviewInstance) {
+        let id = app_webview.id();
+        let target = app_webview.target_id();
+        self.windows
+            .insert(target, app_webview.desktop_context.clone());
+        let detached = self
+            .hosts
+            .bind(id, target)
+            .and_then(|previous| self.webviews.remove(&previous));
+        self.webviews.insert(id, app_webview);
+        if let Some(previous) = detached {
+            self.detached.insert(previous.id(), previous);
+            // The detached host's pending edit acknowledgement no longer gates the VirtualDom.
+            self.schedule_poll();
+        }
+    }
+
+    /// The platform started the native window `id`, which on Android is an `Activity`.
+    pub fn handle_window_started(&mut self, id: WindowId) {
+        self.handle_new_window();
+        match self.hosts.started(id) {
+            OnStarted::Ignore => {}
+            OnStarted::Build { target } => {
+                let Some(context) = self.windows.get(&target).cloned() else {
+                    return;
+                };
+                match WebviewInstance::rebuild(&context, &mut self.dom, &self.app_context) {
+                    Ok(app_webview) => {
+                        if app_webview.id() != id {
+                            tracing::error!(
+                                "The window for started {id:?} was built on {:?}",
+                                app_webview.id()
+                            );
+                        }
+                        self.bind_host(app_webview);
+                    }
+                    Err(error) => tracing::error!("Failed to rebuild a window for {id:?}: {error}"),
+                }
+            }
+            OnStarted::Rebind { target, host } => {
+                let Some(app_webview) = self.detached.remove(&host) else {
+                    return;
+                };
+                if app_webview.target_id() != target {
+                    self.detached.insert(host, app_webview);
+                    return;
+                }
+                app_webview.rebind();
+                self.bind_host(app_webview);
+            }
+        }
+    }
+
+    /// The logical window that native window `id` renders or rendered last.
+    fn target_of_window(&self, id: WindowId) -> Option<RenderTargetId> {
+        self.hosts.target_of(id).or_else(|| {
+            self.windows
+                .iter()
+                .find(|(_, context)| context.id() == id)
+                .map(|(target, _)| *target)
+        })
+    }
+
     pub fn handle_close_requested(&mut self, id: WindowId) {
-        let Some(window) = self.webviews.get(&id) else {
-            // If the window is not found, we can just return
+        let Some(target) = self.target_of_window(id) else {
             return;
         };
+        let context = self.windows[&target].clone();
 
-        match window.desktop_context.close_behaviour.get() {
+        match context.close_behaviour.get() {
             // If the window is just set to hide when closed, we can just hide it
             WindowCloseBehaviour::WindowHides => {
-                window.desktop_context.window.set_visible(false);
+                context.window().set_visible(false);
             }
 
             // Component-owned windows render out before native teardown. Root
@@ -198,34 +283,53 @@ impl App {
                 #[cfg(debug_assertions)]
                 self.persist_window_state();
 
-                match window.desktop_context.request_window_close() {
+                match context.request_window_close() {
                     WindowCloseRequestResult::DeferredToComponent => {}
-                    WindowCloseRequestResult::CloseImmediately => self.destroy_window(id),
+                    WindowCloseRequestResult::CloseImmediately => self.close_window(target),
                 }
             }
         };
     }
 
+    /// The platform destroyed native window `id`. On Android its window waits for the next `Activity`.
     pub fn window_destroyed(&mut self, id: WindowId) {
-        self.destroy_window(id);
+        if !cfg!(target_os = "android") {
+            self.destroy_window(id);
+            return;
+        }
+        match self.hosts.destroyed(id) {
+            OnDestroyed::Ignore => {}
+            OnDestroyed::Released => _ = self.detached.remove(&id),
+            OnDestroyed::Parked(_) => {
+                self.webviews.remove(&id);
+                self.schedule_poll();
+            }
+        }
     }
 
-    /// Tear down one webview after its Dioxus owner has released the target, or
-    /// immediately for root/unowned windows.
+    /// Close the logical window that native window `id` shows.
     pub(crate) fn destroy_window(&mut self, id: WindowId) {
-        let Some(app_webview) = self.webviews.remove(&id) else {
+        if let Some(target) = self.target_of_window(id) {
+            self.close_window(target);
+        }
+    }
+
+    fn close_window(&mut self, target: RenderTargetId) {
+        let Some(context) = self.windows.remove(&target) else {
             return;
         };
-        app_webview.desktop_context.notify_window_destroyed();
-        let target_id = app_webview.target_id();
+        if let Some(host) = self.hosts.remove_window(target) {
+            self.webviews.remove(&host);
+        }
+        context.notify_window_destroyed();
         // A component-owned `Window` reclaims its own target when its portal is
         // torn down, so this is usually a no-op. When the OS destroys a window
         // (or the app is shutting down) before that teardown runs the portal is
         // still mounted; `remove_render_target` leaves such a target in place and
         // it is reclaimed when the runtime is dropped.
-        self.dom.runtime().remove_render_target(target_id);
+        self.dom.runtime().remove_render_target(target);
 
-        if self.exit_on_last_window_close && self.webviews.is_empty() {
+        if self.exit_on_last_window_close && !self.hosts.has_windows() {
             self.control_flow = ControlFlow::Exit
         } else {
             // Removing the webview drops its `WryQueue`, including any
@@ -244,7 +348,7 @@ impl App {
         if let Some(app_webview) = self.webviews.get(&id) {
             use wry::Rect;
 
-            _ = app_webview.desktop_context.webview.set_bounds(Rect {
+            _ = app_webview.native.webview.set_bounds(Rect {
                 position: wry::dpi::Position::Logical(wry::dpi::LogicalPosition::new(0.0, 0.0)),
                 size: wry::dpi::Size::Physical(wry::dpi::PhysicalSize::new(
                     size.width,
@@ -297,7 +401,9 @@ impl App {
             return;
         }
 
-        if app_webview.initialized_page.replace(page).is_some() {
+        if app_webview.initialized_page.replace(page).is_some()
+            || std::mem::take(&mut app_webview.redraw_first_page)
+        {
             self.redraw_reloaded_page(id);
         } else if !self.initial_dom_rebuild_done {
             self.rebuild_dom();
@@ -633,7 +739,7 @@ impl App {
     #[cfg(debug_assertions)]
     fn persist_window_state(&self) {
         if let Some(app_webview) = self.webviews.values().next() {
-            let window = &app_webview.desktop_context.window;
+            let window = &app_webview.native.window;
 
             let Some(monitor) = window.current_monitor() else {
                 return;

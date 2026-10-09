@@ -22,7 +22,10 @@ type CustomEventHandler = Box<
 
 /// A function taking a URL and returning whether the webview should navigate to it or open it in
 /// the browser. If missing in the config, all URLs will be allowed.
-type NavigationHandler = Box<dyn Fn(&str) -> bool + 'static>;
+pub(crate) type NavigationHandler = Box<dyn Fn(&str) -> bool + 'static>;
+
+/// Called with each native window built for a [`WindowConfig`].
+pub(crate) type OnWindow = Box<dyn FnMut(Arc<Window>, &mut VirtualDom) + 'static>;
 
 /// The closing behaviour of specific application window.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -85,8 +88,7 @@ pub struct WindowConfig {
     pub(crate) additional_windows_args: Option<String>,
     pub(crate) navigation_handler: Option<NavigationHandler>,
 
-    #[allow(clippy::type_complexity)]
-    pub(crate) on_window: Option<Box<dyn FnMut(Arc<Window>, &mut VirtualDom) + 'static>>,
+    pub(crate) on_window: Option<OnWindow>,
 }
 
 impl WindowConfig {

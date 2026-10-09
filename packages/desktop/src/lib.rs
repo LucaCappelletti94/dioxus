@@ -21,6 +21,7 @@ mod hooks;
 mod ipc;
 mod menubar;
 mod mobile;
+mod native_hosts;
 mod protocol;
 mod query;
 mod shortcut;

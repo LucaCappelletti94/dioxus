@@ -57,7 +57,7 @@ impl QueryEngine {
 
         // start the query
         // We embed the return of the eval in a function so we can send it back to the main thread
-        if let Err(err) = context.webview.evaluate_script(&format!(
+        if let Err(err) = context.webview().evaluate_script(&format!(
             r#"(function(){{
                 let dioxus = window.createQuery({request_id});
                 let post_error = function(err) {{
@@ -139,6 +139,11 @@ impl QueryEngine {
             }
         }
     }
+
+    /// Fail every pending query, because the page that would answer them is gone.
+    pub(crate) fn cancel_all(&self) {
+        self.active_requests.slab.borrow_mut().clear();
+    }
 }
 
 pub(crate) struct Query<V: DeserializeOwned> {
@@ -165,7 +170,7 @@ impl<V: DeserializeOwned> Query<V> {
 
         let desktop = self.desktop.upgrade().ok_or(QueryError::Finished)?;
         desktop
-            .webview
+            .webview()
             .evaluate_script(&script)
             .map_err(|e| QueryError::Send(e.to_string()))?;
 

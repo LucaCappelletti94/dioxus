@@ -1,7 +1,13 @@
 use crate::{
-    WindowConfig, assets::AssetHandlerRegistry, edits::EditWebsocket,
-    event_handlers::WindowEventHandlers, file_upload::NativeFileHover, ipc::UserWindowEvent,
-    query::QueryEngine, shortcut::ShortcutRegistry, webview::PendingWebview,
+    WindowConfig,
+    assets::AssetHandlerRegistry,
+    edits::EditWebsocket,
+    event_handlers::WindowEventHandlers,
+    file_upload::NativeFileHover,
+    ipc::UserWindowEvent,
+    query::QueryEngine,
+    shortcut::ShortcutRegistry,
+    webview::{PendingWebview, WindowRecipe},
 };
 use dioxus_core::{RenderTargetId, Runtime};
 use std::{
@@ -79,17 +85,17 @@ impl DesktopAppContext {
     }
 }
 
-/// Native-window state exposed through [`DesktopContext`](crate::DesktopContext).
-///
-/// Dereferences to the underlying [`tao::window::Window`], so window-manipulation methods such as
-/// `set_minimized`, `set_resizable`, or `request_redraw` can be called directly on a
-/// [`DesktopContext`](crate::DesktopContext).
-pub struct DesktopWindowContext {
-    /// The underlying webview handle.
-    pub webview: WebView,
+/// The native window and webview that currently render a logical window.
+#[derive(Clone)]
+pub(crate) struct NativeWindow {
+    pub(crate) window: Arc<Window>,
+    pub(crate) webview: Rc<WebView>,
+}
 
-    /// The native window handle.
-    pub window: Arc<Window>,
+/// One logical window behind a [`DesktopContext`](crate::DesktopContext), whose native window and webview change when Android replaces its `Activity`.
+pub struct DesktopWindowContext {
+    native: RefCell<NativeWindow>,
+    pub(crate) recipe: Rc<WindowRecipe>,
     pub(crate) target_id: RenderTargetId,
     pub(crate) asset_handlers: AssetHandlerRegistry,
     pub(crate) file_hover: NativeFileHover,
@@ -105,16 +111,16 @@ pub struct DesktopWindowContext {
 
 impl DesktopWindowContext {
     pub(crate) fn new(
-        webview: WebView,
-        window: Arc<Window>,
+        native: NativeWindow,
+        recipe: Rc<WindowRecipe>,
         target_id: RenderTargetId,
         asset_handlers: AssetHandlerRegistry,
         file_hover: NativeFileHover,
         close_behaviour: crate::WindowCloseBehaviour,
     ) -> Self {
         Self {
-            webview,
-            window,
+            native: RefCell::new(native),
+            recipe,
             target_id,
             asset_handlers,
             file_hover,
@@ -127,14 +133,30 @@ impl DesktopWindowContext {
         }
     }
 
+    /// The native window currently showing this window.
+    pub fn window(&self) -> Arc<Window> {
+        self.native.borrow().window.clone()
+    }
+
+    /// The webview currently showing this window.
+    pub fn webview(&self) -> Rc<WebView> {
+        self.native.borrow().webview.clone()
+    }
+
+    /// Show this window in `native`, failing the queries sent to the previous page.
+    pub(crate) fn replace_native(&self, native: NativeWindow) {
+        *self.native.borrow_mut() = native;
+        self.query.cancel_all();
+    }
+
     /// Get the native window ID.
     pub fn id(&self) -> WindowId {
-        self.window.id()
+        self.native.borrow().window.id()
     }
 
     /// Set the native window title.
     pub fn set_title(&self, title: &str) {
-        self.window.set_title(title);
+        self.window().set_title(title);
     }
 
     pub(crate) fn register_component_window_callbacks(
@@ -171,24 +193,15 @@ impl DesktopWindowContext {
 
     /// Run `script`, which creates a head element, and keep it for a page that replaces this one.
     pub(crate) fn create_head_element(&self, script: String) {
-        _ = self.webview.evaluate_script(&script);
+        _ = self.webview().evaluate_script(&script);
         self.head_elements.borrow_mut().push(script);
     }
 
     /// Recreate every recorded head element in a page that replaced the one they were made in.
     pub(crate) fn replay_head_elements(&self) {
+        let webview = self.webview();
         for script in self.head_elements.borrow().iter() {
-            _ = self.webview.evaluate_script(script);
+            _ = webview.evaluate_script(script);
         }
-    }
-}
-
-/// Expose the underlying native window so its [`tao`] methods can be called directly on a
-/// [`DesktopContext`](crate::DesktopContext).
-impl std::ops::Deref for DesktopWindowContext {
-    type Target = Window;
-
-    fn deref(&self) -> &Self::Target {
-        &self.window
     }
 }

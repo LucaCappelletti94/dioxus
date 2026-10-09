@@ -76,6 +76,7 @@ pub fn launch_virtual_dom_blocking(virtual_dom: VirtualDom, mut desktop_config: 
                 event, window_id, ..
             } => match event {
                 WindowEvent::CloseRequested => app.handle_close_requested(window_id),
+                WindowEvent::Started => app.handle_window_started(window_id),
                 WindowEvent::Destroyed { .. } => app.window_destroyed(window_id),
                 WindowEvent::Resized(new_size) => app.resize_window(window_id, new_size),
                 _ => {}
@@ -113,7 +114,7 @@ pub fn launch_virtual_dom_blocking(virtual_dom: VirtualDom, mut desktop_config: 
                 UserWindowEvent::WindowsDragDrop(id) => {
                     if let Some(app_webview) = app.webviews.get(&id) {
                         _ = app_webview
-                            .desktop_context
+                            .native
                             .webview
                             .evaluate_script("window.interpreter.handleWindowsDragDrop();");
                     }
@@ -121,19 +122,16 @@ pub fn launch_virtual_dom_blocking(virtual_dom: VirtualDom, mut desktop_config: 
                 UserWindowEvent::WindowsDragLeave(id) => {
                     if let Some(app_webview) = app.webviews.get(&id) {
                         _ = app_webview
-                            .desktop_context
+                            .native
                             .webview
                             .evaluate_script("window.interpreter.handleWindowsDragLeave();");
                     }
                 }
                 UserWindowEvent::WindowsDragOver(id, x_pos, y_pos) => {
                     if let Some(app_webview) = app.webviews.get(&id) {
-                        _ = app_webview
-                            .desktop_context
-                            .webview
-                            .evaluate_script(&format!(
-                                "window.interpreter.handleWindowsDragOver({x_pos}, {y_pos});"
-                            ));
+                        _ = app_webview.native.webview.evaluate_script(&format!(
+                            "window.interpreter.handleWindowsDragOver({x_pos}, {y_pos});"
+                        ));
                     }
                 }
 

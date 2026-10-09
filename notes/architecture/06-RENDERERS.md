@@ -100,6 +100,13 @@ Implements WriteMutations for wry-based rendering:
 - Each served page is numbered. It reports `initialize` with its number and opens the socket when the host answers, and the host ignores a page a newer one is replacing
 - A later `initialize` from the same webview is a reloaded page, such as the one Android loads into a recreated activity. The queue moves to a fresh socket id and the window is redrawn with `VirtualDom::remount_render_target`, keeping component state
 
+### Native Hosts
+`NativeHosts` records which host, a native window with its webview, renders each `Window` component's render target.
+- On Android every `Activity` is a host. A fresh `Activity` reports `WindowEvent::Started`, and the app builds a host for it from the window's `WindowRecipe` and redraws it with `VirtualDom::remount_render_target`
+- The replaced host stays detached until Android destroys it, so `Started` and `Destroyed` may come in either order
+- Destroying a window's only host parks the window with its state. Only a Dioxus close or `Shutdown` ends it
+- `DesktopContext` follows its window, so `window()` and `webview()` return the current host
+
 ### IPC (Interprocess Communication)
 ```
 Browser event → JavaScript → window.postMessage()

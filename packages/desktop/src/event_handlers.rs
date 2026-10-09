@@ -1,4 +1,5 @@
 use crate::{ipc::UserWindowEvent, window};
+use dioxus_core::RenderTargetId;
 use slab::Slab;
 use std::cell::RefCell;
 use tao::{event::Event, event_loop::EventLoopWindowTarget, window::WindowId};
@@ -20,7 +21,8 @@ pub struct WindowEventHandlers {
 }
 
 struct WryWindowEventHandlerInner {
-    window_id: WindowId,
+    /// The logical window whose native window events reach this handler.
+    target: RenderTargetId,
 
     #[allow(clippy::type_complexity)]
     handler:
@@ -30,14 +32,14 @@ struct WryWindowEventHandlerInner {
 impl WindowEventHandlers {
     pub(crate) fn add(
         &self,
-        window_id: WindowId,
+        target: RenderTargetId,
         handler: impl FnMut(&Event<UserWindowEvent>, &EventLoopWindowTarget<UserWindowEvent>) + 'static,
     ) -> WryEventHandler {
         WryEventHandler(
             self.handlers
                 .borrow_mut()
                 .insert(WryWindowEventHandlerInner {
-                    window_id,
+                    target,
                     handler: Box::new(handler),
                 }),
         )
@@ -47,17 +49,20 @@ impl WindowEventHandlers {
         self.handlers.borrow_mut().try_remove(id.0);
     }
 
+    /// Run every handler, giving a window event only to handlers of the window `target_of` returns.
     pub fn apply_event(
         &self,
         event: &Event<UserWindowEvent>,
         target: &EventLoopWindowTarget<UserWindowEvent>,
+        target_of: impl Fn(WindowId) -> Option<RenderTargetId>,
     ) {
+        let event_target = match event {
+            Event::WindowEvent { window_id, .. } => Some(target_of(*window_id)),
+            _ => None,
+        };
         for (_, handler) in self.handlers.borrow_mut().iter_mut() {
-            // if this event does not apply to the window this listener cares about, continue
-            if let Event::WindowEvent { window_id, .. } = event {
-                if *window_id != handler.window_id {
-                    continue;
-                }
+            if event_target.is_some_and(|event_target| event_target != Some(handler.target)) {
+                continue;
             }
 
             (handler.handler)(event, target)

@@ -1,10 +1,13 @@
 use crate::{
     AssetRequest, WindowCloseBehaviour, WindowConfig, WryEventHandler,
     assets::AssetHandlerRegistry,
-    desktop_state::{DesktopAppContext, DesktopWindowContext, WindowCloseRequestResult},
+    desktop_state::{
+        DesktopAppContext, DesktopWindowContext, NativeWindow, WindowCloseRequestResult,
+    },
     file_upload::NativeFileHover,
     ipc::UserWindowEvent,
     shortcut::{HotKey, HotKeyState, ShortcutHandle, ShortcutRegistryError},
+    webview::WindowRecipe,
 };
 use dioxus_core::{Callback, RenderTargetId};
 use std::{
@@ -12,14 +15,13 @@ use std::{
     future::{Future, IntoFuture},
     pin::Pin,
     rc::{Rc, Weak},
-    sync::Arc,
 };
 use tao::{
     event::Event,
     event_loop::EventLoopWindowTarget,
-    window::{Fullscreen as WryFullscreen, Window, WindowId},
+    window::{Fullscreen as WryFullscreen, WindowId},
 };
-use wry::{RequestAsyncResponder, WebView};
+use wry::RequestAsyncResponder;
 
 #[cfg(target_os = "ios")]
 use objc2::rc::Retained;
@@ -115,10 +117,10 @@ impl std::ops::Deref for DesktopService {
 
 impl DesktopService {
     pub(crate) fn new(
-        webview: WebView,
-        window: Arc<Window>,
+        native: NativeWindow,
         app: Rc<DesktopAppContext>,
         target_id: RenderTargetId,
+        recipe: Rc<WindowRecipe>,
         asset_handlers: AssetHandlerRegistry,
         file_hover: NativeFileHover,
         close_behaviour: WindowCloseBehaviour,
@@ -126,8 +128,8 @@ impl DesktopService {
         Self {
             app,
             window_context: DesktopWindowContext::new(
-                webview,
-                window,
+                native,
+                recipe,
                 target_id,
                 asset_handlers,
                 file_hover,
@@ -207,14 +209,16 @@ impl DesktopService {
     /// onmousedown: move |_| { desktop.drag_window(); }
     /// ```
     pub fn drag(&self) {
-        if self.window.fullscreen().is_none() {
-            _ = self.window.drag_window();
+        let window = self.window();
+        if window.fullscreen().is_none() {
+            _ = window.drag_window();
         }
     }
 
     /// Toggle whether the window is maximized or not
     pub fn toggle_maximized(&self) {
-        self.window.set_maximized(!self.window.is_maximized())
+        let window = self.window();
+        window.set_maximized(!window.is_maximized())
     }
 
     /// Set the close behavior of this window
@@ -243,8 +247,9 @@ impl DesktopService {
 
     /// change window to fullscreen
     pub fn set_fullscreen(&self, fullscreen: bool) {
-        if let Some(handle) = &self.window.current_monitor() {
-            self.window.set_fullscreen(
+        let window = self.window();
+        if let Some(handle) = &window.current_monitor() {
+            window.set_fullscreen(
                 fullscreen.then_some(WryFullscreen::Borderless(Some(handle.clone()))),
             );
         }
@@ -252,14 +257,14 @@ impl DesktopService {
 
     /// launch print modal
     pub fn print(&self) {
-        if let Err(e) = self.webview.print() {
+        if let Err(e) = self.webview().print() {
             tracing::warn!("Open print modal failed: {e}");
         }
     }
 
     /// Set the zoom level of the webview
     pub fn set_zoom_level(&self, level: f64) {
-        if let Err(e) = self.webview.zoom(level) {
+        if let Err(e) = self.webview().zoom(level) {
             tracing::warn!("Set webview zoom failed: {e}");
         }
     }
@@ -267,7 +272,7 @@ impl DesktopService {
     /// opens DevTool window
     pub fn devtool(&self) {
         #[cfg(debug_assertions)]
-        self.webview.open_devtools();
+        self.webview().open_devtools();
 
         #[cfg(not(debug_assertions))]
         tracing::warn!("Devtools are disabled in release builds");
@@ -281,7 +286,7 @@ impl DesktopService {
         &self,
         handler: impl FnMut(&Event<UserWindowEvent>, &EventLoopWindowTarget<UserWindowEvent>) + 'static,
     ) -> WryEventHandler {
-        self.app.event_handlers.add(self.window.id(), handler)
+        self.app.event_handlers.add(self.target_id, handler)
     }
 
     /// Remove a wry event handler created with [`Self::create_wry_event_handler`]
@@ -340,7 +345,7 @@ impl DesktopService {
     pub fn ui_view(&self) -> objc2::rc::Retained<objc2_ui_kit::UIView> {
         use objc2::rc::Retained;
         use objc2_ui_kit::UIView;
-        let ui_view = self.window.ui_view().cast::<UIView>();
+        let ui_view = self.window().ui_view().cast::<UIView>();
         unsafe { Retained::retain(ui_view) }.unwrap()
     }
 
@@ -349,7 +354,10 @@ impl DesktopService {
     pub fn ui_view_controller(&self) -> objc2::rc::Retained<objc2_ui_kit::UIViewController> {
         use objc2::rc::Retained;
         use objc2_ui_kit::UIViewController;
-        let ui_view_controller = self.window.ui_view_controller().cast::<UIViewController>();
+        let ui_view_controller = self
+            .window()
+            .ui_view_controller()
+            .cast::<UIViewController>();
         unsafe { Retained::retain(ui_view_controller) }.unwrap()
     }
 
