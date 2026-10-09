@@ -15,7 +15,19 @@ pub extern "C" fn start_app() {
     use dioxus_core::{Element, VirtualDom};
     use std::any::Any;
 
-    tao::android_binding!(dev_dioxus, main, Rust, wry::android_setup, root, tao);
+    unsafe fn android_setup(
+        package: &str,
+        env: ::wry::prelude::JNIEnv<'_>,
+        looper: &::ndk::looper::ThreadLooper,
+        activity: ::wry::prelude::GlobalRef,
+    ) {
+        ::manganis::android::set_current_activity(activity.clone());
+        unsafe {
+            wry::android_setup(package, env, looper, activity);
+        }
+    }
+
+    tao::android_binding!(dev_dioxus, main, Rust, android_setup, root, tao);
     wry::android_binding!(dev_dioxus, main, wry);
 
     #[cfg(target_os = "android")]
